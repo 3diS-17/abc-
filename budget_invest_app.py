@@ -4,32 +4,75 @@ import plotly.express as px
 import requests
 import google.generativeai as genai
 
-# 🔐 Secrets
+# =========================
+# 🔐 Secrets (Streamlit)
+# =========================
+# st.secrets structure expected:
+# st.secrets["botpress"]["chat_api_id"]
+# st.secrets["botpress"]["token"]
+# st.secrets["gemini"]["api_key"]
+# st.secrets["openrouter"]["api_key"]
+# st.secrets["alpha_vantage"]["api_key"]
+
 bot_id = st.secrets["botpress"]["chat_api_id"]
 BOTPRESS_TOKEN = st.secrets["botpress"]["token"]
-genai.configure(api_key=st.secrets["gemini"]["api_key"])
+genai.configure(api_key=st.secrets["gemini"]["api_key"])  # Gemini API (new)
 OPENROUTER_API_KEY = st.secrets["openrouter"]["api_key"]
 API_KEY = st.secrets["alpha_vantage"]["api_key"]
 
+# Prefer 1.5 Pro, fallback to Flash if Pro is unavailable to your key/region
+DEFAULT_GEMINI_MODEL = "gemini-1.5-pro"
+FALLBACK_GEMINI_MODEL = "gemini-1.5-flash"
+
+def get_supported_gemini_model():
+    """Try to use Pro; if not supported for generateContent, fall back to Flash; if list fails, just use Pro."""
+    try:
+        models = list(genai.list_models())
+        names = [m.name for m in models if hasattr(m, "supported_generation_methods") and "generateContent" in m.supported_generation_methods]
+        if any(DEFAULT_GEMINI_MODEL in n for n in names):
+            return DEFAULT_GEMINI_MODEL
+        if any(FALLBACK_GEMINI_MODEL in n for n in names):
+            return FALLBACK_GEMINI_MODEL
+        # If neither is enumerated, still try Pro
+        return DEFAULT_GEMINI_MODEL
+    except Exception:
+        return DEFAULT_GEMINI_MODEL
+
+# =========================
 # 📄 App config
+# =========================
 st.set_page_config(page_title="💸 Multi-LLM Budget Planner", layout="wide")
 st.title("💸 Budgeting + Investment Planner (Multi-LLM AI Suggestions)")
 
-# 📉 Alpha Vantage function
-def get_alpha_vantage_monthly_return(symbol):
-    url = f"https://www.alphavantage.co/query?function=TIME_SERIES_MONTHLY_ADJUSTED&symbol={symbol}&apikey={API_KEY}"
-    r = requests.get(url)
-    if r.status_code != 200:
+# =========================
+# 📉 Alpha Vantage helper
+# =========================
+def get_alpha_vantage_monthly_return(symbol: str):
+    url = (
+        "https://www.alphavantage.co/query"
+        f"?function=TIME_SERIES_MONTHLY_ADJUSTED&symbol={symbol}&apikey={API_KEY}"
+    )
+    try:
+        r = requests.get(url, timeout=20)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        ts = data.get("Monthly Adjusted Time Series") or {}
+        if not isinstance(ts, dict) or len(ts) < 2:
+            return None
+        # sort by date desc so index 0/1 are latest two months
+        dates = sorted(ts.keys(), reverse=True)
+        close0 = float(ts[dates[0]]["5. adjusted close"])
+        close1 = float(ts[dates[1]]["5. adjusted close"])
+        if close1 == 0:
+            return None
+        return (close0 - close1) / close1
+    except Exception:
         return None
-    data = r.json()
-    ts = data.get("Monthly Adjusted Time Series", {})
-    closes = [float(v["5. adjusted close"]) for v in ts.values()]
-    if len(closes) < 2:
-        return None
-    monthly_return = (closes[0] - closes[1]) / closes[1]
-    return monthly_return
 
+# =========================
 # 🧾 Inputs
+# =========================
 st.sidebar.header("📊 Monthly Income")
 income = st.sidebar.number_input("Monthly income (before tax, $)", min_value=0.0, value=5000.0, step=100.0)
 tax_rate = st.sidebar.slider("Tax rate (%)", 0, 50, 20)
@@ -52,28 +95,34 @@ fixed_deposit = st.sidebar.number_input("Fixed deposit ($)", 0.0, 5000.0, 0.0, 1
 months = st.sidebar.slider("Projection period (months)", 1, 60, 12)
 savings_target = st.sidebar.number_input("Savings target at end of period ($)", 0.0, 1_000_000.0, 10000.0, 500.0)
 
-# 📈 Returns
+# =========================
+# 📈 Returns (with safe defaults)
+# =========================
 stock_r = get_alpha_vantage_monthly_return("SPY") or 0.01
-bond_r = get_alpha_vantage_monthly_return("AGG") or 0.003
-real_r = 0.004
+bond_r  = get_alpha_vantage_monthly_return("AGG") or 0.003
+real_r  = 0.004
 crypto_r = 0.02
-fd_r = 0.003
+fd_r     = 0.003
 
+# =========================
 # 💰 Calculations
+# =========================
 after_tax_income = income * (1 - tax_rate / 100)
 total_exp = housing + food + transport + utilities + entertainment + others
 total_inv = stocks + bonds + real_estate + crypto + fixed_deposit
 net_flow = after_tax_income - total_exp - total_inv
 
-bal = 0
+bal = 0.0
 rows = []
 for m in range(1, months + 1):
     bal += net_flow
-    stock_val = stocks * ((1 + stock_r)**m - 1) / stock_r
-    bond_val = bonds * ((1 + bond_r)**m - 1) / bond_r
-    real_val = real_estate * ((1 + real_r)**m - 1) / real_r
-    crypto_val = crypto * ((1 + crypto_r)**m - 1) / crypto_r
-    fd_val = fixed_deposit * ((1 + fd_r)**m - 1) / fd_r
+    # Future value of annuity formula per bucket
+    stock_val = stocks * ((1 + stock_r) ** m - 1) / stock_r if stock_r else stocks * m
+    bond_val  = bonds * ((1 + bond_r)  ** m - 1) / bond_r  if bond_r else bonds * m
+    real_val  = real_estate * ((1 + real_r) ** m - 1) / real_r if real_r else real_estate * m
+    crypto_val = crypto * ((1 + crypto_r) ** m - 1) / crypto_r if crypto_r else crypto * m
+    fd_val     = fixed_deposit * ((1 + fd_r) ** m - 1) / fd_r if fd_r else fixed_deposit * m
+
     net_worth = bal + stock_val + bond_val + real_val + crypto_val + fd_val
     rows.append({
         "Month": m,
@@ -87,19 +136,32 @@ for m in range(1, months + 1):
     })
 df = pd.DataFrame(rows)
 
+# =========================
 # 📋 Summary
+# =========================
 st.subheader("📋 Summary")
-st.metric("Income (gross)", f"${income:,.2f}")
-st.metric("After tax income", f"${after_tax_income:,.2f}")
-st.metric("Expenses", f"${total_exp:,.2f}")
-st.metric("Investments", f"${total_inv:,.2f}")
-st.metric("Net Cash Flow", f"${net_flow:,.2f}/mo")
+colA, colB, colC, colD, colE = st.columns(5)
+colA.metric("Income (gross)", f"${income:,.2f}")
+colB.metric("After tax income", f"${after_tax_income:,.2f}")
+colC.metric("Expenses", f"${total_exp:,.2f}")
+colD.metric("Investments", f"${total_inv:,.2f}")
+colE.metric("Net Cash Flow", f"${net_flow:,.2f}/mo")
 
+# =========================
 # 📊 Charts
+# =========================
 st.subheader("📈 Net Worth Growth")
-fig = px.line(df, x="Month", y=["Balance", "Stocks", "Bonds", "RealEstate", "Crypto", "FixedDeposit", "NetWorth"],
-              markers=True, title="Net Worth & Investments Over Time")
-fig.add_hline(y=savings_target, line_dash="dash", line_color="red", annotation_text="Target")
+fig = px.line(
+    df,
+    x="Month",
+    y=["Balance", "Stocks", "Bonds", "RealEstate", "Crypto", "FixedDeposit", "NetWorth"],
+    markers=True,
+    title="Net Worth & Investments Over Time",
+)
+try:
+    fig.add_hline(y=savings_target, line_dash="dash", line_color="red", annotation_text="Target")
+except Exception:
+    pass
 st.plotly_chart(fig, use_container_width=True)
 
 st.subheader("🧾 Expense Breakdown")
@@ -123,7 +185,9 @@ inv_s = pd.Series({
 })
 st.plotly_chart(px.pie(names=inv_s.index, values=inv_s.values, title="Investment Breakdown"), use_container_width=True)
 
+# =========================
 # 🤖 AI Suggestions
+# =========================
 st.subheader("🤖 AI Suggestions")
 col1, col2 = st.columns(2)
 
@@ -143,9 +207,10 @@ Provide advice on expense control, investment balance, and achieving target.
 if col1.button("Generate Gemini Suggestion"):
     with st.spinner("Gemini generating..."):
         try:
-            model = genai.GenerativeModel("gemini-pro")
+            model_name = get_supported_gemini_model()
+            model = genai.GenerativeModel(model_name=model_name)
             response = model.generate_content(prompt)
-            st.write(response.text)
+            st.write(response.text or "")
         except Exception as e:
             st.error(f"Gemini error: {e}")
 
@@ -160,14 +225,16 @@ if col2.button("Generate DeepSeek Suggestion"):
                 "model": "deepseek/deepseek-r1:free",
                 "messages": [{"role": "user", "content": prompt}]
             }
-            res = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload)
+            res = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=30)
             res.raise_for_status()
             out = res.json()["choices"][0]["message"]["content"]
             st.write(out)
         except Exception as e:
             st.error(f"OpenRouter error: {e}")
 
+# =========================
 # 💬 Botpress Text Chat
+# =========================
 st.subheader("🤖 Ask Your Financial Assistant (Botpress)")
 
 # Safely initialize conversation
@@ -175,7 +242,11 @@ if "conversation_id" not in st.session_state:
     try:
         init = requests.post(
             "https://chat.botpress.cloud/v1/chat/conversations",
-            headers={"Authorization": f"Bearer {BOTPRESS_TOKEN}"}
+            headers={
+                "Authorization": f"Bearer {BOTPRESS_TOKEN}",
+                "X-Bot-Id": bot_id,  # important
+            },
+            timeout=20
         )
         init.raise_for_status()
         st.session_state.conversation_id = init.json().get("id")
@@ -192,13 +263,10 @@ if st.button("Send to Botpress"):
     elif "conversation_id" not in st.session_state:
         st.error("❌ No active conversation. Please reload the app.")
     else:
-        # Send message
         payload = {
             "type": "text",
             "role": "user",
-            "payload": {
-                "text": user_message
-            }
+            "payload": {"text": user_message}
         }
 
         try:
@@ -209,7 +277,8 @@ if st.button("Send to Botpress"):
                     "Authorization": f"Bearer {BOTPRESS_TOKEN}",
                     "X-Bot-Id": bot_id,
                     "Content-Type": "application/json"
-                }
+                },
+                timeout=20
             )
             res.raise_for_status()
             st.success("✅ Message sent to Botpress!")
@@ -221,15 +290,17 @@ if st.button("Send to Botpress"):
         try:
             reply_res = requests.get(
                 f"https://chat.botpress.cloud/v1/chat/conversations/{st.session_state.conversation_id}/messages",
-                headers={"Authorization": f"Bearer {BOTPRESS_TOKEN}"}
+                headers={
+                    "Authorization": f"Bearer {BOTPRESS_TOKEN}",
+                    "X-Bot-Id": bot_id,  # add header here too
+                },
+                timeout=20
             )
             reply_res.raise_for_status()
             data = reply_res.json()
             messages = data.get("messages", [])
-
-            # Extract latest assistant reply
-            replies = [m["payload"]["text"] for m in messages if m["role"] == "assistant" and m["type"] == "text"]
-            if replies:
+            replies = [m.get("payload", {}).get("text", "") for m in messages if m.get("role") == "assistant" and m.get("type") == "text"]
+            if replies and replies[-1]:
                 st.info(f"🤖 Botpress: {replies[-1]}")
             else:
                 st.warning("⚠️ Botpress sent no reply.")

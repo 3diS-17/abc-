@@ -2,41 +2,19 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import requests
-import google.generativeai as genai
+from openai import OpenAI
 
 # =========================
-# 🔐 Secrets (Streamlit)
+# 🔐 Secrets
 # =========================
-# st.secrets structure expected:
-# st.secrets["botpress"]["chat_api_id"]
-# st.secrets["botpress"]["token"]
-# st.secrets["gemini"]["api_key"]
-# st.secrets["openrouter"]["api_key"]
-# st.secrets["alpha_vantage"]["api_key"]
-
 bot_id = st.secrets["botpress"]["chat_api_id"]
 BOTPRESS_TOKEN = st.secrets["botpress"]["token"]
-genai.configure(api_key=st.secrets["gemini"]["api_key"])  # Gemini API (new)
+
+OPENAI_API_KEY = st.secrets["openai"]["api_key"]
 OPENROUTER_API_KEY = st.secrets["openrouter"]["api_key"]
 API_KEY = st.secrets["alpha_vantage"]["api_key"]
 
-# Prefer 1.5 Pro, fallback to Flash if Pro is unavailable to your key/region
-DEFAULT_GEMINI_MODEL = "gemini-1.5-pro"
-FALLBACK_GEMINI_MODEL = "gemini-1.5-flash"
-
-def get_supported_gemini_model():
-    """Try to use Pro; if not supported for generateContent, fall back to Flash; if list fails, just use Pro."""
-    try:
-        models = list(genai.list_models())
-        names = [m.name for m in models if hasattr(m, "supported_generation_methods") and "generateContent" in m.supported_generation_methods]
-        if any(DEFAULT_GEMINI_MODEL in n for n in names):
-            return DEFAULT_GEMINI_MODEL
-        if any(FALLBACK_GEMINI_MODEL in n for n in names):
-            return FALLBACK_GEMINI_MODEL
-        # If neither is enumerated, still try Pro
-        return DEFAULT_GEMINI_MODEL
-    except Exception:
-        return DEFAULT_GEMINI_MODEL
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 # =========================
 # 📄 App config
@@ -60,7 +38,6 @@ def get_alpha_vantage_monthly_return(symbol: str):
         ts = data.get("Monthly Adjusted Time Series") or {}
         if not isinstance(ts, dict) or len(ts) < 2:
             return None
-        # sort by date desc so index 0/1 are latest two months
         dates = sorted(ts.keys(), reverse=True)
         close0 = float(ts[dates[0]]["5. adjusted close"])
         close1 = float(ts[dates[1]]["5. adjusted close"])
@@ -96,7 +73,7 @@ months = st.sidebar.slider("Projection period (months)", 1, 60, 12)
 savings_target = st.sidebar.number_input("Savings target at end of period ($)", 0.0, 1_000_000.0, 10000.0, 500.0)
 
 # =========================
-# 📈 Returns (with safe defaults)
+# 📈 Returns (safe defaults)
 # =========================
 stock_r = get_alpha_vantage_monthly_return("SPY") or 0.01
 bond_r  = get_alpha_vantage_monthly_return("AGG") or 0.003
@@ -116,7 +93,6 @@ bal = 0.0
 rows = []
 for m in range(1, months + 1):
     bal += net_flow
-    # Future value of annuity formula per bucket
     stock_val = stocks * ((1 + stock_r) ** m - 1) / stock_r if stock_r else stocks * m
     bond_val  = bonds * ((1 + bond_r)  ** m - 1) / bond_r  if bond_r else bonds * m
     real_val  = real_estate * ((1 + real_r) ** m - 1) / real_r if real_r else real_estate * m
@@ -158,10 +134,7 @@ fig = px.line(
     markers=True,
     title="Net Worth & Investments Over Time",
 )
-try:
-    fig.add_hline(y=savings_target, line_dash="dash", line_color="red", annotation_text="Target")
-except Exception:
-    pass
+fig.add_hline(y=savings_target, line_dash="dash", line_color="red", annotation_text="Target")
 st.plotly_chart(fig, use_container_width=True)
 
 st.subheader("🧾 Expense Breakdown")
@@ -192,27 +165,32 @@ st.subheader("🤖 AI Suggestions")
 col1, col2 = st.columns(2)
 
 prompt = f"""
-Financial summary:
+You are a budgeting coach. Use concise bullet points.
+
 Gross income: ${income}
 Tax rate: {tax_rate}%
 After-tax income: ${after_tax_income}
 Expenses: ${total_exp}
 Investments: ${total_inv}
 Net cash flow: ${net_flow}/mo
-Savings target: ${savings_target}
+Savings target after {months} months: ${savings_target}
 Projected net worth: ${df['NetWorth'].iloc[-1]}
-Provide advice on expense control, investment balance, and achieving target.
+
+Advise: (1) expense cuts, (2) investment allocation, (3) reaching savings target.
 """
 
-if col1.button("Generate Gemini Suggestion"):
-    with st.spinner("Gemini generating..."):
+if col1.button("Generate OpenAI Suggestion"):
+    with st.spinner("OpenAI generating..."):
         try:
-            model_name = get_supported_gemini_model()
-            model = genai.GenerativeModel(model_name=model_name)
-            response = model.generate_content(prompt)
-            st.write(response.text or "")
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.7,
+            )
+            out = resp.choices[0].message.content
+            st.write(out)
         except Exception as e:
-            st.error(f"Gemini error: {e}")
+            st.error(f"OpenAI error: {e}")
 
 if col2.button("Generate DeepSeek Suggestion"):
     with st.spinner("DeepSeek generating..."):
@@ -244,7 +222,7 @@ if "conversation_id" not in st.session_state:
             "https://chat.botpress.cloud/v1/chat/conversations",
             headers={
                 "Authorization": f"Bearer {BOTPRESS_TOKEN}",
-                "X-Bot-Id": bot_id,  # important
+                "X-Bot-Id": bot_id,
             },
             timeout=20
         )
@@ -292,7 +270,7 @@ if st.button("Send to Botpress"):
                 f"https://chat.botpress.cloud/v1/chat/conversations/{st.session_state.conversation_id}/messages",
                 headers={
                     "Authorization": f"Bearer {BOTPRESS_TOKEN}",
-                    "X-Bot-Id": bot_id,  # add header here too
+                    "X-Bot-Id": bot_id,
                 },
                 timeout=20
             )
